@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tinyphoto:chat-events:1.0.0",
+  "title": "tinyphoto encrypted chat realtime event",
+  "description": "Validate Supabase Broadcast payload for chat:<conversation_id>:v<epoch> and chat-inbox:<user_id>. Never contains plaintext message content.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "type", "conversation_id", "occurred_at", "data"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "event_id": {"type": "string", "format": "uuid"},
+    "type": {"enum": ["CHAT_MESSAGE", "CHAT_RECEIPT", "CHAT_TYPING", "CHAT_INBOX_UPDATED"]},
+    "conversation_id": {"type": "string", "format": "uuid"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "data": {"type": "object"}
+  }
+}

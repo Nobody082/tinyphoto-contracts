@@ -1,0 +1,1456 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: tinyphoto API
+  version: 1.1.0
+  description: |
+    Metadata-only API. Images travel directly between client RAM and private R2.
+    1.1.0 adds image/avif (additive). Readers must accept image/avif before any
+    writer uploads it; the backend keeps AVIF reservations behind an operator gate.
+    All responses use Cache-Control: no-store. Dates are UTC RFC3339.
+    Mutating POST commands require Idempotency-Key except authentication; keys are
+    actor+route scoped for 24h. Same key/body returns the original result; a
+    changed body returns 409. Read-only download grants omit idempotency keys.
+    Expired signed URLs are never silently renewed. Idempotency records contain
+    metadata only; reconstruct upload signatures with the original signing time.
+    JWTs are Supabase access tokens, never Google ID tokens outside auth/google.
+    Snapshot GET lazily materializes expiry. Inaccessible resources return 404.
+servers:
+  - url: /
+    description: Configured backend origin; clients supply its deployment base URL.
+security:
+  - bearerAuth: []
+tags:
+  - {name: Auth}
+  - {name: Frames}
+  - {name: Admin}
+  - {name: Rooms}
+  - {name: Media}
+  - {name: Memories}
+  - {name: Chat}
+  - {name: System}
+paths:
+  /api/v1/time:
+    get:
+      operationId: getServerTime
+      tags: [System]
+      security: []
+      summary: UTC clock sample for midpoint offset measurement
+      responses:
+        '200': {description: Clock sample, content: {application/json: {schema: {$ref: '#/components/schemas/Time'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/auth/google:
+    post:
+      operationId: exchangeGoogleToken
+      tags: [Auth]
+      security: []
+      summary: Exchange Google ID token and nonce for a Supabase session
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/GoogleCredentials'}}}}
+      responses:
+        '200': {description: Session credentials; no server-side token persistence or idempotency record, content: {application/json: {schema: {$ref: '#/components/schemas/Session'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/auth/register:
+    post:
+      operationId: registerUser
+      tags: [Auth]
+      security: []
+      summary: Register a new email/password account; existing emails return 409 CONFLICT
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RegisterRequest'}}}}
+      responses:
+        '201': {description: Registered user; no sensitive information returned, content: {application/json: {schema: {$ref: '#/components/schemas/User'}}}}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/auth/login:
+    post:
+      operationId: loginWithPassword
+      tags: [Auth]
+      security: []
+      summary: Authenticate with email and password for a Supabase session
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordCredentials'}}}}
+      responses:
+        '200': {description: Session credentials; no server-side token persistence or idempotency record, content: {application/json: {schema: {$ref: '#/components/schemas/Session'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/auth/refresh:
+    post:
+      operationId: refreshSession
+      tags: [Auth]
+      security: []
+      summary: Rotate refresh token; serialize client calls and discard old token
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RefreshCredentials'}}}}
+      responses:
+        '200': {description: Rotated session, content: {application/json: {schema: {$ref: '#/components/schemas/Session'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/auth/logout:
+    post:
+      operationId: logoutSession
+      tags: [Auth]
+      summary: Revoke current refresh session; issued JWTs expire normally
+      responses:
+        '204': {description: Session revoked; clear RAM and close channels}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/auth/me:
+    get:
+      operationId: getCurrentUser
+      tags: [Auth]
+      responses:
+        '200': {description: Verified user, content: {application/json: {schema: {$ref: '#/components/schemas/User'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms:
+    post:
+      operationId: createRoom
+      tags: [Rooms]
+      summary: Create 60-minute room and add caller as unready host
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateRoom'}}}}
+      responses:
+        '201': {description: Room snapshot, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/join:
+    post:
+      operationId: joinRoom
+      tags: [Rooms]
+      summary: Join a LOBBY by code; capacity and one-active-room rule are atomic
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/JoinRoom'}}}}
+      responses:
+        '200': {description: Joined snapshot; existing active membership is a no-op, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/{room_id}:
+    parameters: [{$ref: '#/components/parameters/RoomId'}]
+    get:
+      operationId: getRoomSnapshot
+      tags: [Rooms]
+      summary: Consistent snapshot; active members only, including terminal state
+      responses:
+        '200': {description: Subscribe first then snapshot to recover event gaps, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      operationId: closeRoom
+      tags: [Rooms]
+      summary: Host closes room and cancels active round; repeated close is a no-op
+      parameters: [{$ref: '#/components/parameters/ExpectedVersion'}]
+      responses:
+        '204': {description: Closed}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/{room_id}/members/me:
+    parameters: [{$ref: '#/components/parameters/RoomId'}]
+    patch:
+      operationId: setReady
+      tags: [Rooms]
+      summary: Set own ready flag in LOBBY after camera and clock checks
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ReadyRequest'}}}}
+      responses:
+        '200': {description: Snapshot; repeated flag is a no-op, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      operationId: leaveRoom
+      tags: [Rooms]
+      summary: Leave LOBBY; host leave closes room; rotate channel epoch for member leave
+      responses:
+        '204': {description: Left; repeat by former member is a no-op}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/{room_id}/members/me/slot:
+    parameters: [{$ref: '#/components/parameters/RoomId'}]
+    patch:
+      operationId: moveRoomSlot
+      tags: [Rooms]
+      summary: Move active member (including host) to an unoccupied frame slot in LOBBY
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MoveSlotRequest'}}}}
+      responses:
+        '200': {description: Snapshot with updated slot_index and room_version, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/{room_id}/members/{user_id}:
+    parameters:
+      - {$ref: '#/components/parameters/RoomId'}
+      - {name: user_id, in: path, required: true, schema: {type: string, format: uuid}}
+    delete:
+      operationId: kickRoomMember
+      tags: [Rooms]
+      summary: Host removes a participant in LOBBY and rotates channel epoch
+      parameters: [{$ref: '#/components/parameters/ExpectedVersion'}]
+      responses:
+        '200': {description: Updated snapshot for host; former members refetch or leave, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/{room_id}/rounds:
+    parameters: [{$ref: '#/components/parameters/RoomId'}]
+    post:
+      operationId: startRound
+      tags: [Rooms]
+      summary: Host freezes 2–6 ready participants and schedules four absolute shutters
+      description: Requires at least 300 seconds remaining before room expiry; otherwise 409 STATE_CONFLICT.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/StartRoundRequest'}}}}
+      responses:
+        '201': {description: Snapshot including countdown, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/{room_id}/rounds/{round_id}:
+    parameters: [{$ref: '#/components/parameters/RoomId'}, {$ref: '#/components/parameters/RoundId'}]
+    delete:
+      operationId: cancelRound
+      tags: [Rooms]
+      summary: Host cancels a nonterminal round and resets ready flags
+      parameters: [{$ref: '#/components/parameters/ExpectedVersion'}]
+      responses:
+        '204': {description: Cancelled; already cancelled is a no-op}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/rooms/{room_id}/rounds/{round_id}/shutters/{shot_index}:
+    parameters: [{$ref: '#/components/parameters/RoomId'}, {$ref: '#/components/parameters/RoundId'}, {$ref: '#/components/parameters/ShotIndex'}]
+    post:
+      operationId: materializeShutter
+      tags: [Rooms]
+      summary: Any frozen participant materializes due shutter once; never schedules hardware capture
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: Snapshot; no new event if already materialized, content: {application/json: {schema: {$ref: '#/components/schemas/RoomSnapshot'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/media/presigned-upload:
+    post:
+      operationId: reserveMediaUpload
+      tags: [Media]
+      summary: Reserve quota and grant private, exact-size conditional PUT for 120 seconds
+      description: |
+        No bytes in this request. Slot requires room_id, round_id, shot_index and
+        captured_at; caller must own that frozen slot and its due shutter must be materialized.
+        Group composition requires room_id, round_id and all source_media_ids;
+        caller must be host and round must be COMPOSING. Individual forbids room
+        fields. Invalid cross-field combinations return 422. Pending reservations
+        are unique per logical slot/final; an existing live reservation returns 409.
+        Sign Content-Type, Content-Length, Cache-Control and If-None-Match: *.
+        Adapter fails closed if exact-size or conditional create is unsupported.
+        image/avif returns 422 VALIDATION_ERROR while the operator AVIF gate is off;
+        the client then re-encodes in RAM as PNG (perforated stamp, alpha) or JPEG.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UploadRequest'}}}}
+      responses:
+        '201': {description: Reserved PUT grant, content: {application/json: {schema: {$ref: '#/components/schemas/UploadGrant'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/media/{media_id}/complete:
+    parameters: [{$ref: '#/components/parameters/MediaId'}]
+    post:
+      operationId: completeMediaUpload
+      tags: [Media]
+      summary: Owner commits after HEAD verification; slot emits event, final creates memories
+      description: Missing or mismatched R2 object returns 409; expiry returns 410. No client ETag is trusted. Conditional create prevents overwrite after HEAD. Response is intrinsically idempotent by media_id.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: Committed receipt, content: {application/json: {schema: {$ref: '#/components/schemas/MediaReceipt'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/media/{media_id}/presigned-download:
+    parameters: [{$ref: '#/components/parameters/MediaId'}]
+    post:
+      operationId: grantMediaDownload
+      tags: [Media]
+      summary: Grant 60-second GET to memory owner or frozen participant composing active round
+      description: Slot grants stop once round is terminal. Final grants require a live own memory reference. GET URL is bearer access until expiry; never store it. Inaccessible IDs return 404.
+      responses:
+        '200': {description: RAM-only download grant, content: {application/json: {schema: {$ref: '#/components/schemas/DownloadGrant'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/memories:
+    get:
+      operationId: listMemories
+      tags: [Memories]
+      summary: Own unexpired committed memories, newest first, cursor ordered by created_at and id
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 50, default: 20}}
+        - {name: cursor, in: query, schema: {type: string, minLength: 1, maxLength: 512}, description: Opaque signed cursor from preceding page; malformed cursor returns 422}
+      responses:
+        '200': {description: Metadata only; request separate download grants, content: {application/json: {schema: {$ref: '#/components/schemas/MemoryPage'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/memories/{memory_id}:
+    parameters:
+      - {name: memory_id, in: path, required: true, schema: {type: string, format: uuid}}
+    delete:
+      operationId: deleteMemory
+      tags: [Memories]
+      summary: Delete own reference immediately; shared object queued only after last reference and PUT expiry
+      responses:
+        '204': {description: Deleted or previously deleted by same owner; issued GETs can survive 60 seconds}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/users:
+    get:
+      operationId: searchChatUsers
+      tags: [Chat]
+      summary: Search registered tinyphoto users to start an encrypted conversation
+      parameters:
+        - {name: q, in: query, schema: {type: string, maxLength: 80}}
+      responses:
+        '200': {description: Matching user directory, content: {application/json: {schema: {$ref: '#/components/schemas/ChatDirectory'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/keys:
+    post:
+      operationId: registerChatKey
+      tags: [Chat]
+      summary: Register current device/session ECDH P-256 public key for client-side E2EE
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RegisterChatKeyRequest'}}}}
+      responses:
+        '201': {description: Active key and optional PIN-wrapped key backup metadata, content: {application/json: {schema: {$ref: '#/components/schemas/ChatKeyStatus'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/keys/backup:
+    get:
+      operationId: getChatKeyBackup
+      tags: [Chat]
+      summary: Fetch user PIN-wrapped E2EE private key backup (never plaintext)
+      responses:
+        '200': {description: Encrypted private key backup, content: {application/json: {schema: {$ref: '#/components/schemas/ChatKeyBackup'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: saveChatKeyBackup
+      tags: [Chat]
+      summary: Save PIN-wrapped E2EE private key backup encrypted in client RAM
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SaveChatKeyBackupRequest'}}}}
+      responses:
+        '200': {description: Saved encrypted backup, content: {application/json: {schema: {$ref: '#/components/schemas/ChatKeyBackup'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/conversations:
+    get:
+      operationId: listChatConversations
+      tags: [Chat]
+      summary: List encrypted conversations, participants, unread counts, and latest encrypted message
+      responses:
+        '200': {description: Conversation inbox, content: {application/json: {schema: {$ref: '#/components/schemas/ChatInbox'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: createOrGetDirectConversation
+      tags: [Chat]
+      summary: Atomically create or return the direct E2EE conversation with a peer user
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateDirectConversationRequest'}}}}
+      responses:
+        '200': {description: Direct conversation snapshot, content: {application/json: {schema: {$ref: '#/components/schemas/ChatConversation'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/conversations/{conversation_id}/keys:
+    parameters: [{$ref: '#/components/parameters/ConversationId'}]
+    get:
+      operationId: getConversationKeys
+      tags: [Chat]
+      summary: Fetch active E2EE public keys for participants in the conversation
+      responses:
+        '200': {description: Participant public keys, content: {application/json: {schema: {$ref: '#/components/schemas/ChatPublicKeyList'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/conversations/{conversation_id}/messages:
+    parameters: [{$ref: '#/components/parameters/ConversationId'}]
+    get:
+      operationId: listChatMessages
+      tags: [Chat]
+      summary: List ciphertext messages in ascending sequence order for a slice
+      parameters:
+        - {name: before_seq, in: query, schema: {type: integer, minimum: 1}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 50, default: 30}}
+      responses:
+        '200': {description: Encrypted message slice, content: {application/json: {schema: {$ref: '#/components/schemas/ChatMessagePage'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: sendChatMessage
+      tags: [Chat]
+      summary: Relay and persist an end-to-end encrypted message (server never sees plaintext)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SendChatMessageRequest'}}}}
+      responses:
+        '201': {description: Persisted encrypted message receipt, content: {application/json: {schema: {$ref: '#/components/schemas/ChatMessage'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/conversations/{conversation_id}/receipts:
+    parameters: [{$ref: '#/components/parameters/ConversationId'}]
+    post:
+      operationId: ackChatReceipt
+      tags: [Chat]
+      summary: Advance monotonic delivered/read watermark for the authenticated participant
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ChatReceiptRequest'}}}}
+      responses:
+        '200': {description: Updated participant watermark, content: {application/json: {schema: {$ref: '#/components/schemas/ChatReceiptResponse'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/chat/conversations/{conversation_id}/typing:
+    parameters: [{$ref: '#/components/parameters/ConversationId'}]
+    post:
+      operationId: sendChatTyping
+      tags: [Chat]
+      summary: Broadcast ephemeral typing state over private chat Realtime channel
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ChatTypingRequest'}}}}
+      responses:
+        '204': {description: Typing event broadcast}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/frames:
+    get:
+      operationId: listActiveFrames
+      tags: [Frames]
+      summary: List active decorative stamp and photobooth frames available to users
+      parameters:
+        - {name: category, in: query, schema: {$ref: '#/components/schemas/FrameCategory'}}
+      responses:
+        '200': {description: Active frame list, content: {application/json: {schema: {$ref: '#/components/schemas/FrameList'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/overview:
+    get:
+      operationId: getAdminOverview
+      tags: [Admin]
+      summary: Aggregate operational overview counts for admin dashboard
+      responses:
+        '200': {description: Admin overview counters, content: {application/json: {schema: {$ref: '#/components/schemas/AdminOverview'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/frames:
+    get:
+      operationId: adminListFrames
+      tags: [Admin]
+      summary: List all stamp and photobooth frames including inactive frames
+      parameters:
+        - {name: category, in: query, schema: {$ref: '#/components/schemas/FrameCategory'}}
+      responses:
+        '200': {description: All frames, content: {application/json: {schema: {$ref: '#/components/schemas/FrameList'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: adminCreateFrame
+      tags: [Admin]
+      summary: Create a new stamp or photobooth frame preset
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateFrameRequest'}}}}
+      responses:
+        '201': {description: Created frame, content: {application/json: {schema: {$ref: '#/components/schemas/Frame'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/frames/{frame_id}:
+    parameters: [{$ref: '#/components/parameters/FrameId'}]
+    patch:
+      operationId: adminUpdateFrame
+      tags: [Admin]
+      summary: Update an existing stamp or photobooth frame
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UpdateFrameRequest'}}}}
+      responses:
+        '200': {description: Updated frame, content: {application/json: {schema: {$ref: '#/components/schemas/Frame'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      operationId: adminDeleteFrame
+      tags: [Admin]
+      summary: Delete a stamp or photobooth frame
+      responses:
+        '204': {description: Frame deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/users:
+    get:
+      operationId: adminListUsers
+      tags: [Admin]
+      summary: List tinyphoto user accounts with search and pagination
+      parameters:
+        - {name: q, in: query, schema: {type: string, maxLength: 80}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      responses:
+        '200': {description: User account page, content: {application/json: {schema: {$ref: '#/components/schemas/AdminUserList'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: adminCreateUser
+      tags: [Admin]
+      summary: Provision a user or admin account
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AdminCreateUserRequest'}}}}
+      responses:
+        '201': {description: Created account, content: {application/json: {schema: {$ref: '#/components/schemas/AdminUser'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/users/{user_id}:
+    parameters: [{$ref: '#/components/parameters/UserId'}]
+    patch:
+      operationId: adminUpdateUser
+      tags: [Admin]
+      summary: Update user display name, phone, role or disabled flag
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AdminUpdateUserRequest'}}}}
+      responses:
+        '200': {description: Updated account, content: {application/json: {schema: {$ref: '#/components/schemas/AdminUser'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      operationId: adminDeleteUser
+      tags: [Admin]
+      summary: Delete a user account and purge owned data
+      responses:
+        '204': {description: User account deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/users/{user_id}/data:
+    parameters: [{$ref: '#/components/parameters/UserId'}]
+    get:
+      operationId: adminGetUserData
+      tags: [Admin]
+      summary: Inspect all stored metadata associated with a user account
+      responses:
+        '200': {description: User metadata bundle, content: {application/json: {schema: {$ref: '#/components/schemas/AdminUserData'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      operationId: adminPurgeUserData
+      tags: [Admin]
+      summary: Purge selected scope of user data (memories, uploads, rooms, chat, or all)
+      parameters:
+        - {name: scope, in: query, schema: {$ref: '#/components/schemas/AdminPurgeScope', default: ALL}}
+      responses:
+        '200': {description: Purge summary, content: {application/json: {schema: {$ref: '#/components/schemas/AdminPurgeResult'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/memories:
+    get:
+      operationId: adminListMemories
+      tags: [Admin]
+      summary: List user stamp and photobooth memories
+      parameters:
+        - {name: kind, in: query, schema: {$ref: '#/components/schemas/MemoryKind'}}
+        - {name: user_id, in: query, schema: {type: string, format: uuid}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      responses:
+        '200': {description: Admin memory list, content: {application/json: {schema: {$ref: '#/components/schemas/AdminMemoryList'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: adminCreateMemory
+      tags: [Admin]
+      summary: Create a stamp or photobooth memory metadata record for a user
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AdminCreateMemoryRequest'}}}}
+      responses:
+        '201': {description: Created memory record, content: {application/json: {schema: {$ref: '#/components/schemas/AdminMemory'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/memories/{memory_id}:
+    parameters: [{$ref: '#/components/parameters/MemoryId'}]
+    patch:
+      operationId: adminUpdateMemory
+      tags: [Admin]
+      summary: Reassign owner, kind or expiration of a memory record
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AdminUpdateMemoryRequest'}}}}
+      responses:
+        '200': {description: Updated memory record, content: {application/json: {schema: {$ref: '#/components/schemas/AdminMemory'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      operationId: adminDeleteMemory
+      tags: [Admin]
+      summary: Delete a user stamp or photobooth memory and clean orphaned object
+      responses:
+        '204': {description: Memory deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/media/{media_id}/presigned-download:
+    parameters: [{$ref: '#/components/parameters/MediaId'}]
+    post:
+      operationId: adminGrantMediaDownload
+      tags: [Admin]
+      summary: Issue short-lived RAM-only download grant for admin media inspection
+      responses:
+        '200': {description: RAM-only download grant, content: {application/json: {schema: {$ref: '#/components/schemas/DownloadGrant'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/rooms:
+    get:
+      operationId: adminListRooms
+      tags: [Admin]
+      summary: List user photobooth rooms
+      parameters:
+        - {name: state, in: query, schema: {$ref: '#/components/schemas/RoomState'}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      responses:
+        '200': {description: Admin room list, content: {application/json: {schema: {$ref: '#/components/schemas/AdminRoomList'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: adminCreateRoom
+      tags: [Admin]
+      summary: Create a photobooth room on behalf of a regular user host
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AdminCreateRoomRequest'}}}}
+      responses:
+        '201': {description: Created room, content: {application/json: {schema: {$ref: '#/components/schemas/AdminRoom'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/admin/rooms/{room_id}:
+    parameters: [{$ref: '#/components/parameters/RoomId'}]
+    patch:
+      operationId: adminUpdateRoom
+      tags: [Admin]
+      summary: Update photobooth room capacity, layout or lifecycle state
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AdminUpdateRoomRequest'}}}}
+      responses:
+        '200': {description: Updated room, content: {application/json: {schema: {$ref: '#/components/schemas/AdminRoom'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Invalid'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      operationId: adminDeleteRoom
+      tags: [Admin]
+      summary: Delete a photobooth room
+      responses:
+        '204': {description: Room deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: Supabase JWT}
+  parameters:
+    IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, format: uuid}}
+    ExpectedVersion: {name: expected_version, in: query, required: true, schema: {type: integer, minimum: 1}, description: Current room version; compare atomically. Already completed no-ops succeed before version comparison.}
+    RoomId: {name: room_id, in: path, required: true, schema: {type: string, format: uuid}}
+    RoundId: {name: round_id, in: path, required: true, schema: {type: string, format: uuid}}
+    MediaId: {name: media_id, in: path, required: true, schema: {type: string, format: uuid}}
+    ConversationId: {name: conversation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    ShotIndex: {name: shot_index, in: path, required: true, schema: {type: integer, minimum: 0, maximum: 3}}
+    UserId: {name: user_id, in: path, required: true, schema: {type: string, format: uuid}}
+    FrameId: {name: frame_id, in: path, required: true, schema: {type: string, format: uuid}}
+    MemoryId: {name: memory_id, in: path, required: true, schema: {type: string, format: uuid}}
+  responses:
+    Unauthorized: {description: 'Missing, invalid or expired credentials', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    Forbidden: {description: Authenticated but operation requires host or authorized purpose, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    NotFound: {description: Unknown or inaccessible resource/code, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    Conflict: {description: Version/state/capacity/idempotency/upload conflict, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    Gone: {description: Owned media reservation or content expired, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    Invalid: {description: Invalid request including missing required headers or cross-field constraint, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    RateLimited:
+      description: Rate or free-budget admission limit reached
+      headers: {Retry-After: {required: true, schema: {type: integer, minimum: 1}, description: Seconds before retry}}
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    Unavailable:
+      description: Dependency unavailable or signing conformance gate not passed
+      headers: {Retry-After: {required: true, schema: {type: integer, minimum: 1}}}
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+  schemas:
+    Time:
+      type: object
+      additionalProperties: false
+      required: [server_time]
+      properties: {server_time: {type: string, format: date-time}}
+    UserRole:
+      type: string
+      enum: [USER, ADMIN]
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, role, disabled]
+      properties:
+        id: {type: string, format: uuid}
+        display_name: {type: string, minLength: 1, maxLength: 60}
+        role: {$ref: '#/components/schemas/UserRole'}
+        disabled: {type: boolean}
+    GoogleCredentials:
+      type: object
+      additionalProperties: false
+      required: [id_token, nonce]
+      properties:
+        id_token: {type: string, minLength: 1, maxLength: 8192, writeOnly: true}
+        nonce: {type: string, minLength: 32, maxLength: 128, writeOnly: true, description: Cryptographically random raw nonce; Google receives SHA-256 hex}
+        provider_access_token: {type: string, minLength: 1, maxLength: 4096, writeOnly: true, description: Required when Google ID token includes at_hash}
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [full_name, email, password, confirm_password]
+      properties:
+        full_name: {type: string, minLength: 1, maxLength: 60}
+        email: {type: string, minLength: 3, maxLength: 254}
+        phone: {type: [string, 'null'], minLength: 8, maxLength: 24}
+        password: {type: string, minLength: 8, maxLength: 72, writeOnly: true}
+        confirm_password: {type: string, minLength: 8, maxLength: 72, writeOnly: true}
+    PasswordCredentials:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: {type: string, minLength: 3, maxLength: 254}
+        password: {type: string, minLength: 1, maxLength: 72, writeOnly: true}
+    RefreshCredentials:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties: {refresh_token: {type: string, minLength: 1, maxLength: 4096, writeOnly: true}}
+    Session:
+      type: object
+      additionalProperties: false
+      required: [access_token, refresh_token, token_type, expires_at, user]
+      properties:
+        access_token: {type: string, minLength: 1}
+        refresh_token: {type: string, minLength: 1}
+        token_type: {const: Bearer}
+        expires_at: {type: string, format: date-time}
+        user: {$ref: '#/components/schemas/User'}
+    RoomFrameLayout:
+      type: string
+      enum: [STRIP_2X1, STRIP_3X1, GRID_2X2, STRIP_4X1, GRID_3X2]
+    CreateRoom:
+      type: object
+      additionalProperties: false
+      required: [capacity]
+      properties:
+        capacity: {type: integer, minimum: 2, maximum: 6}
+        frame_layout: {$ref: '#/components/schemas/RoomFrameLayout'}
+        frame_id: {type: [string, 'null'], format: uuid}
+    JoinRoom:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties: {code: {type: string, pattern: '^[0-9]{6}$', examples: ['042781']}}
+    VersionRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties: {expected_version: {type: integer, minimum: 1}}
+    StartRoundRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties:
+        expected_version: {type: integer, minimum: 1}
+        countdown_seconds: {type: integer, minimum: 0, maximum: 10}
+    MoveSlotRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version, slot_index]
+      properties:
+        expected_version: {type: integer, minimum: 1}
+        slot_index: {type: integer, minimum: 0, maximum: 5}
+    ReadyRequest:
+      type: object
+      additionalProperties: false
+      required: [ready]
+      properties: {ready: {type: boolean}}
+    Member:
+      type: object
+      additionalProperties: false
+      required: [user_id, display_name, ready, joined_at, slot_index]
+      properties:
+        user_id: {type: string, format: uuid}
+        display_name: {type: string, minLength: 1, maxLength: 60}
+        ready: {type: boolean}
+        joined_at: {type: string, format: date-time}
+        slot_index: {type: integer, minimum: 0, maximum: 5}
+    RoomState: {type: string, enum: [LOBBY, ACTIVE, CLOSED, EXPIRED]}
+    RoundState: {type: string, enum: [COUNTDOWN, COLLECTING, COMPOSING, COMPLETE, CANCELLED, EXPIRED]}
+    Slot:
+      type: object
+      additionalProperties: false
+      required: [user_id, shot_index, media_id, captured_at]
+      properties:
+        user_id: {type: string, format: uuid}
+        shot_index: {type: integer, minimum: 0, maximum: 3}
+        media_id: {type: string, format: uuid}
+        captured_at: {type: string, format: date-time, description: Informational client exposure time; not trusted for admission}
+    Round:
+      type: object
+      additionalProperties: false
+      required: [id, state, participant_ids, shutter_times, materialized_shots, upload_deadline, composition_deadline, slots, final_media_id]
+      properties:
+        id: {type: string, format: uuid}
+        state: {$ref: '#/components/schemas/RoundState'}
+        participant_ids: {type: array, minItems: 2, maxItems: 6, uniqueItems: true, items: {type: string, format: uuid}}
+        shutter_times: {type: array, minItems: 4, maxItems: 4, items: {type: string, format: date-time}, description: Index 0..3; strictly ascending four-second intervals}
+        materialized_shots: {type: array, maxItems: 4, uniqueItems: true, items: {type: integer, minimum: 0, maximum: 3}}
+        upload_deadline: {type: string, format: date-time}
+        composition_deadline: {type: string, format: date-time}
+        slots: {type: array, maxItems: 24, items: {$ref: '#/components/schemas/Slot'}}
+        final_media_id: {type: [string, 'null'], format: uuid}
+    RoomSnapshot:
+      type: object
+      additionalProperties: false
+      required: [id, code, host_id, capacity, frame_layout, state, room_version, channel_topic, expires_at, server_time, members, round]
+      properties:
+        id: {type: string, format: uuid}
+        code: {type: string, pattern: '^[0-9]{6}$'}
+        host_id: {type: string, format: uuid}
+        capacity: {type: integer, minimum: 2, maximum: 6}
+        frame_layout: {$ref: '#/components/schemas/RoomFrameLayout'}
+        frame_id: {type: [string, 'null'], format: uuid}
+        state: {$ref: '#/components/schemas/RoomState'}
+        room_version: {type: integer, minimum: 1}
+        channel_topic: {type: string, pattern: '^room:[0-9a-f-]{36}:v[1-9][0-9]*$'}
+        expires_at: {type: string, format: date-time}
+        server_time: {type: string, format: date-time}
+        members: {type: array, minItems: 1, maxItems: 6, items: {$ref: '#/components/schemas/Member'}}
+        round: {oneOf: [{$ref: '#/components/schemas/Round'}, {type: 'null'}], description: Current or most recent round; terminal snapshot remains recoverable}
+    UploadRequest:
+      type: object
+      additionalProperties: false
+      required: [purpose, content_type, size_bytes, width, height]
+      properties:
+        purpose: {type: string, enum: [SLOT, INDIVIDUAL, GROUP_COMPOSITION]}
+        content_type: {type: string, enum: [image/jpeg, image/png, image/avif]}
+        size_bytes: {type: integer, minimum: 1, maximum: 4000000}
+        width: {type: integer, minimum: 1, maximum: 6000}
+        height: {type: integer, minimum: 1, maximum: 6000}
+        room_id: {type: string, format: uuid}
+        round_id: {type: string, format: uuid}
+        shot_index: {type: integer, minimum: 0, maximum: 3}
+        captured_at: {type: string, format: date-time}
+        source_media_ids: {type: array, minItems: 8, maxItems: 24, uniqueItems: true, items: {type: string, format: uuid}}
+      allOf:
+        - if: {properties: {purpose: {const: SLOT}}}
+          then:
+            required: [room_id, round_id, shot_index, captured_at]
+            properties: {size_bytes: {maximum: 2000000}, width: {maximum: 1500}, height: {maximum: 1500}}
+            not: {required: [source_media_ids]}
+        - if: {properties: {purpose: {const: INDIVIDUAL}}}
+          then:
+            properties: {size_bytes: {maximum: 2000000}}
+            not: {anyOf: [{required: [room_id]}, {required: [round_id]}, {required: [shot_index]}, {required: [captured_at]}, {required: [source_media_ids]}]}
+        - if: {properties: {purpose: {const: GROUP_COMPOSITION}}}
+          then:
+            required: [room_id, round_id, source_media_ids]
+            not: {anyOf: [{required: [shot_index]}, {required: [captured_at]}]}
+    UploadGrant:
+      type: object
+      additionalProperties: false
+      required: [media_id, method, url, headers, required_content_length, expires_at, media_expires_at]
+      properties:
+        media_id: {type: string, format: uuid}
+        method: {const: PUT}
+        url: {type: string, format: uri}
+        headers:
+          type: object
+          additionalProperties: false
+          required: [Content-Type, Cache-Control, If-None-Match]
+          properties:
+            Content-Type: {type: string, enum: [image/jpeg, image/png, image/avif]}
+            Cache-Control: {const: 'no-store, max-age=0'}
+            If-None-Match: {const: '*'}
+        required_content_length: {type: integer, minimum: 1, maximum: 4000000, description: 'Signed Content-Length; browser derives from Blob, native sends exact length'}
+        expires_at: {type: string, format: date-time, description: Minimum of now+120 seconds and upload/composition deadline; completion must precede that deadline}
+        media_expires_at: {type: string, format: date-time, description: Final logical expiry is seven days after reservation; slots may be purged earlier}
+    MediaReceipt:
+      type: object
+      additionalProperties: false
+      required: [media_id, purpose, status, expires_at, own_memory_id]
+      properties:
+        media_id: {type: string, format: uuid}
+        purpose: {type: string, enum: [SLOT, INDIVIDUAL, GROUP_COMPOSITION]}
+        status: {const: COMMITTED}
+        expires_at: {type: string, format: date-time}
+        own_memory_id: {type: [string, 'null'], format: uuid, description: Null for SLOT; final returns caller's independent memory reference}
+    DownloadGrant:
+      type: object
+      additionalProperties: false
+      required: [media_id, method, url, expires_at]
+      properties:
+        media_id: {type: string, format: uuid}
+        method: {const: GET}
+        url: {type: string, format: uri}
+        expires_at: {type: string, format: date-time, description: Minimum of now+60 seconds and logical media expiry}
+    Memory:
+      type: object
+      additionalProperties: false
+      required: [id, media_id, purpose, content_type, width, height, size_bytes, created_at, expires_at]
+      properties:
+        id: {type: string, format: uuid}
+        media_id: {type: string, format: uuid}
+        purpose: {type: string, enum: [INDIVIDUAL, GROUP_COMPOSITION]}
+        content_type: {type: string, enum: [image/jpeg, image/png, image/avif]}
+        width: {type: integer, minimum: 1, maximum: 6000}
+        height: {type: integer, minimum: 1, maximum: 6000}
+        size_bytes: {type: integer, minimum: 1, maximum: 4000000}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    MemoryPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, maxItems: 50, items: {$ref: '#/components/schemas/Memory'}}
+        next_cursor: {type: [string, 'null'], maxLength: 512}
+    ChatPeer:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, online, last_seen]
+      properties:
+        id: {type: string, format: uuid}
+        display_name: {type: string, minLength: 1, maxLength: 60}
+        online: {type: boolean}
+        last_seen: {type: string, format: date-time}
+    ChatDirectory:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: {type: array, maxItems: 20, items: {$ref: '#/components/schemas/ChatPeer'}}
+    ChatPublicKey:
+      type: object
+      additionalProperties: false
+      required: [key_id, user_id, public_key_spki, algorithm, device_label, is_active, created_at]
+      properties:
+        key_id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        public_key_spki: {type: string, minLength: 32, maxLength: 512}
+        algorithm: {const: ECDH-P256-AES256GCM-V1}
+        device_label: {type: string, minLength: 1, maxLength: 40}
+        is_active: {type: boolean}
+        created_at: {type: string, format: date-time}
+    ChatPublicKeyList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/ChatPublicKey'}}
+    RegisterChatKeyRequest:
+      type: object
+      additionalProperties: false
+      required: [key_id, public_key_spki, algorithm, device_label]
+      properties:
+        key_id: {type: string, format: uuid}
+        public_key_spki: {type: string, minLength: 32, maxLength: 512}
+        algorithm: {const: ECDH-P256-AES256GCM-V1}
+        device_label: {type: string, minLength: 1, maxLength: 40}
+    ChatKeyBackup:
+      type: object
+      additionalProperties: false
+      required: [key_id, public_key_spki, wrapped_private_key, salt, iv, kdf_iterations, updated_at]
+      properties:
+        key_id: {type: string, format: uuid}
+        public_key_spki: {type: string, minLength: 32, maxLength: 512}
+        wrapped_private_key: {type: string, minLength: 32, maxLength: 2048}
+        salt: {type: string, minLength: 16, maxLength: 128}
+        iv: {type: string, minLength: 12, maxLength: 64}
+        kdf_iterations: {type: integer, minimum: 100000, maximum: 1000000}
+        updated_at: {type: string, format: date-time}
+    SaveChatKeyBackupRequest:
+      type: object
+      additionalProperties: false
+      required: [key_id, wrapped_private_key, salt, iv, kdf_iterations]
+      properties:
+        key_id: {type: string, format: uuid}
+        wrapped_private_key: {type: string, minLength: 32, maxLength: 2048}
+        salt: {type: string, minLength: 16, maxLength: 128}
+        iv: {type: string, minLength: 12, maxLength: 64}
+        kdf_iterations: {type: integer, minimum: 100000, maximum: 1000000}
+    ChatKeyStatus:
+      type: object
+      additionalProperties: false
+      required: [key, has_backup, backup]
+      properties:
+        key: {$ref: '#/components/schemas/ChatPublicKey'}
+        has_backup: {type: boolean}
+        backup: {oneOf: [{$ref: '#/components/schemas/ChatKeyBackup'}, {type: 'null'}]}
+    ChatKeyEnvelope:
+      type: object
+      additionalProperties: false
+      required: [key_id, ephemeral_public_key, key_iv, wrapped_key]
+      properties:
+        key_id: {type: string, format: uuid}
+        ephemeral_public_key: {type: string, minLength: 32, maxLength: 512}
+        key_iv: {type: string, minLength: 12, maxLength: 64}
+        wrapped_key: {type: string, minLength: 32, maxLength: 256}
+    ChatMessage:
+      type: object
+      additionalProperties: false
+      required: [id, conversation_id, seq, sender_id, sender_key_id, message_type, ciphertext, iv, aad, envelopes, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        conversation_id: {type: string, format: uuid}
+        seq: {type: integer, minimum: 1}
+        sender_id: {type: string, format: uuid}
+        sender_key_id: {type: string, format: uuid}
+        message_type: {type: string, enum: [TEXT, REACTION, SYSTEM]}
+        ciphertext: {type: string, minLength: 16, maxLength: 6000}
+        iv: {type: string, minLength: 12, maxLength: 64}
+        aad: {type: string, minLength: 1, maxLength: 256}
+        envelopes: {type: array, minItems: 1, maxItems: 16, items: {$ref: '#/components/schemas/ChatKeyEnvelope'}}
+        created_at: {type: string, format: date-time}
+    ChatMessagePage:
+      type: object
+      additionalProperties: false
+      required: [items, has_more]
+      properties:
+        items: {type: array, maxItems: 50, items: {$ref: '#/components/schemas/ChatMessage'}}
+        has_more: {type: boolean}
+    SendChatMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [message_id, sender_key_id, message_type, ciphertext, iv, aad, envelopes]
+      properties:
+        message_id: {type: string, format: uuid}
+        sender_key_id: {type: string, format: uuid}
+        message_type: {type: string, enum: [TEXT, REACTION]}
+        ciphertext: {type: string, minLength: 16, maxLength: 6000}
+        iv: {type: string, minLength: 12, maxLength: 64}
+        aad: {type: string, minLength: 1, maxLength: 256}
+        envelopes: {type: array, minItems: 1, maxItems: 16, items: {$ref: '#/components/schemas/ChatKeyEnvelope'}}
+    ChatParticipant:
+      type: object
+      additionalProperties: false
+      required: [user_id, display_name, online, last_seen, last_delivered_seq, last_read_seq, last_read_at, active_keys]
+      properties:
+        user_id: {type: string, format: uuid}
+        display_name: {type: string, minLength: 1, maxLength: 60}
+        online: {type: boolean}
+        last_seen: {type: string, format: date-time}
+        last_delivered_seq: {type: integer, minimum: 0}
+        last_read_seq: {type: integer, minimum: 0}
+        last_read_at: {type: [string, 'null'], format: date-time}
+        active_keys: {type: array, maxItems: 16, items: {$ref: '#/components/schemas/ChatPublicKey'}}
+    ChatConversation:
+      type: object
+      additionalProperties: false
+      required: [id, kind, title, channel_topic, created_at, last_message_at, last_message_seq, unread_count, participants, last_message]
+      properties:
+        id: {type: string, format: uuid}
+        kind: {type: string, enum: [DIRECT, GROUP]}
+        title: {type: [string, 'null'], maxLength: 80}
+        channel_topic: {type: string, pattern: '^chat:[0-9a-f-]{36}:v[1-9][0-9]*$'}
+        created_at: {type: string, format: date-time}
+        last_message_at: {type: [string, 'null'], format: date-time}
+        last_message_seq: {type: integer, minimum: 0}
+        unread_count: {type: integer, minimum: 0}
+        participants: {type: array, minItems: 1, maxItems: 16, items: {$ref: '#/components/schemas/ChatParticipant'}}
+        last_message: {oneOf: [{$ref: '#/components/schemas/ChatMessage'}, {type: 'null'}]}
+    ChatInbox:
+      type: object
+      additionalProperties: false
+      required: [items, inbox_channel, unread_total]
+      properties:
+        items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/ChatConversation'}}
+        inbox_channel: {type: string, pattern: '^chat-inbox:[0-9a-f-]{36}$'}
+        unread_total: {type: integer, minimum: 0}
+    CreateDirectConversationRequest:
+      type: object
+      additionalProperties: false
+      required: [peer_user_id]
+      properties:
+        peer_user_id: {type: string, format: uuid}
+    ChatReceiptRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        delivered_seq: {type: [integer, 'null'], minimum: 0}
+        read_seq: {type: [integer, 'null'], minimum: 0}
+    ChatReceiptResponse:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, user_id, last_delivered_seq, last_read_seq, last_read_at]
+      properties:
+        conversation_id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        last_delivered_seq: {type: integer, minimum: 0}
+        last_read_seq: {type: integer, minimum: 0}
+        last_read_at: {type: [string, 'null'], format: date-time}
+    ChatTypingRequest:
+      type: object
+      additionalProperties: false
+      required: [is_typing]
+      properties:
+        is_typing: {type: boolean}
+    FrameCategory:
+      type: string
+      enum: [STAMP, PHOTOBOOTH]
+    FrameLayout:
+      type: string
+      enum: [STAMP_1X1, STRIP_2X1, STRIP_3X1, GRID_2X2, STRIP_4X1, GRID_3X2]
+    Frame:
+      type: object
+      additionalProperties: false
+      required: [id, name, category, layout, background_color, border_color, accent_color, text_color, caption_text, border_width, perforated, active, sort_order, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string, minLength: 1, maxLength: 80}
+        category: {$ref: '#/components/schemas/FrameCategory'}
+        layout: {$ref: '#/components/schemas/FrameLayout'}
+        background_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$'}
+        border_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$'}
+        accent_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$'}
+        text_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$'}
+        caption_text: {type: string, maxLength: 60}
+        border_width: {type: integer, minimum: 0, maximum: 48}
+        perforated: {type: boolean}
+        active: {type: boolean}
+        sort_order: {type: integer, minimum: 0, maximum: 10000}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    FrameList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/Frame'}}
+    CreateFrameRequest:
+      type: object
+      additionalProperties: false
+      required: [name, category, layout]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 80}
+        category: {$ref: '#/components/schemas/FrameCategory'}
+        layout: {$ref: '#/components/schemas/FrameLayout'}
+        background_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$', default: '#FFF8E7'}
+        border_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$', default: '#181818'}
+        accent_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$', default: '#FFD447'}
+        text_color: {type: string, pattern: '^#[0-9a-fA-F]{6}$', default: '#181818'}
+        caption_text: {type: string, maxLength: 60, default: 'TINYPHOTO'}
+        border_width: {type: integer, minimum: 0, maximum: 48, default: 6}
+        perforated: {type: boolean, default: true}
+        active: {type: boolean, default: true}
+        sort_order: {type: integer, minimum: 0, maximum: 10000, default: 100}
+    UpdateFrameRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {type: [string, 'null'], minLength: 1, maxLength: 80}
+        category: {oneOf: [{$ref: '#/components/schemas/FrameCategory'}, {type: 'null'}]}
+        layout: {oneOf: [{$ref: '#/components/schemas/FrameLayout'}, {type: 'null'}]}
+        background_color: {type: [string, 'null'], pattern: '^#[0-9a-fA-F]{6}$'}
+        border_color: {type: [string, 'null'], pattern: '^#[0-9a-fA-F]{6}$'}
+        accent_color: {type: [string, 'null'], pattern: '^#[0-9a-fA-F]{6}$'}
+        text_color: {type: [string, 'null'], pattern: '^#[0-9a-fA-F]{6}$'}
+        caption_text: {type: [string, 'null'], maxLength: 60}
+        border_width: {type: [integer, 'null'], minimum: 0, maximum: 48}
+        perforated: {type: [boolean, 'null']}
+        active: {type: [boolean, 'null']}
+        sort_order: {type: [integer, 'null'], minimum: 0, maximum: 10000}
+    AdminOverview:
+      type: object
+      additionalProperties: false
+      required: [total_users, active_users, disabled_users, total_memories, stamp_memories, photobooth_memories, total_rooms, active_rooms, total_frames, stamp_frames, photobooth_frames]
+      properties:
+        total_users: {type: integer, minimum: 0}
+        active_users: {type: integer, minimum: 0}
+        disabled_users: {type: integer, minimum: 0}
+        total_memories: {type: integer, minimum: 0}
+        stamp_memories: {type: integer, minimum: 0}
+        photobooth_memories: {type: integer, minimum: 0}
+        total_rooms: {type: integer, minimum: 0}
+        active_rooms: {type: integer, minimum: 0}
+        total_frames: {type: integer, minimum: 0}
+        stamp_frames: {type: integer, minimum: 0}
+        photobooth_frames: {type: integer, minimum: 0}
+    AdminUser:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, email, phone, role, disabled, quota_used_bytes, created_at, last_seen]
+      properties:
+        id: {type: string, format: uuid}
+        display_name: {type: string, minLength: 1, maxLength: 60}
+        email: {type: [string, 'null'], maxLength: 254}
+        phone: {type: [string, 'null'], maxLength: 24}
+        role: {$ref: '#/components/schemas/UserRole'}
+        disabled: {type: boolean}
+        quota_used_bytes: {type: integer, minimum: 0}
+        created_at: {type: string, format: date-time}
+        last_seen: {type: [string, 'null'], format: date-time}
+    AdminUserList:
+      type: object
+      additionalProperties: false
+      required: [items, total]
+      properties:
+        items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/AdminUser'}}
+        total: {type: integer, minimum: 0}
+    AdminCreateUserRequest:
+      type: object
+      additionalProperties: false
+      required: [display_name, email, password]
+      properties:
+        display_name: {type: string, minLength: 1, maxLength: 60}
+        email: {type: string, minLength: 3, maxLength: 254}
+        phone: {type: [string, 'null'], minLength: 8, maxLength: 24}
+        password: {type: string, minLength: 8, maxLength: 72, writeOnly: true}
+        role: {$ref: '#/components/schemas/UserRole', default: USER}
+    AdminUpdateUserRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        display_name: {type: [string, 'null'], minLength: 1, maxLength: 60}
+        phone: {type: [string, 'null'], maxLength: 24}
+        role: {oneOf: [{$ref: '#/components/schemas/UserRole'}, {type: 'null'}]}
+        disabled: {type: [boolean, 'null']}
+    MemoryKind:
+      type: string
+      enum: [STAMP, PHOTOBOOTH]
+    AdminMemory:
+      type: object
+      additionalProperties: false
+      required: [memory_id, owner_id, owner_display_name, media_id, kind, mime, byte_size, room_id, round_id, created_at, expires_at]
+      properties:
+        memory_id: {type: string, format: uuid}
+        owner_id: {type: string, format: uuid}
+        owner_display_name: {type: string, minLength: 1, maxLength: 60}
+        media_id: {type: string, format: uuid}
+        kind: {$ref: '#/components/schemas/MemoryKind'}
+        mime: {type: string, enum: [image/png, image/jpeg, image/webp, image/avif]}
+        byte_size: {type: integer, minimum: 1}
+        room_id: {type: [string, 'null'], format: uuid}
+        round_id: {type: [string, 'null'], format: uuid}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    AdminMemoryList:
+      type: object
+      additionalProperties: false
+      required: [items, total]
+      properties:
+        items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/AdminMemory'}}
+        total: {type: integer, minimum: 0}
+    AdminCreateMemoryRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id, kind, mime, byte_size]
+      properties:
+        user_id: {type: string, format: uuid}
+        kind: {$ref: '#/components/schemas/MemoryKind'}
+        mime: {type: string, enum: [image/png, image/jpeg, image/webp, image/avif]}
+        byte_size: {type: integer, minimum: 1, maximum: 8388608}
+        room_id: {type: [string, 'null'], format: uuid}
+        round_id: {type: [string, 'null'], format: uuid}
+    AdminUpdateMemoryRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        owner_id: {type: [string, 'null'], format: uuid}
+        kind: {oneOf: [{$ref: '#/components/schemas/MemoryKind'}, {type: 'null'}]}
+        expires_at: {type: [string, 'null'], format: date-time}
+    AdminRoom:
+      type: object
+      additionalProperties: false
+      required: [id, code, host_id, host_display_name, capacity, frame_layout, frame_id, state, member_count, created_at, expires_at]
+      properties:
+        id: {type: string, format: uuid}
+        code: {type: string, pattern: '^[0-9]{6}$'}
+        host_id: {type: string, format: uuid}
+        host_display_name: {type: string, minLength: 1, maxLength: 60}
+        capacity: {type: integer, minimum: 2, maximum: 6}
+        frame_layout: {$ref: '#/components/schemas/RoomFrameLayout'}
+        frame_id: {type: [string, 'null'], format: uuid}
+        state: {$ref: '#/components/schemas/RoomState'}
+        member_count: {type: integer, minimum: 0, maximum: 6}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    AdminRoomList:
+      type: object
+      additionalProperties: false
+      required: [items, total]
+      properties:
+        items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/AdminRoom'}}
+        total: {type: integer, minimum: 0}
+    AdminCreateRoomRequest:
+      type: object
+      additionalProperties: false
+      required: [host_id, capacity]
+      properties:
+        host_id: {type: string, format: uuid}
+        capacity: {type: integer, minimum: 2, maximum: 6}
+        frame_layout: {$ref: '#/components/schemas/RoomFrameLayout', default: STRIP_4X1}
+        frame_id: {type: [string, 'null'], format: uuid}
+    AdminUpdateRoomRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        capacity: {type: [integer, 'null'], minimum: 2, maximum: 6}
+        frame_layout: {oneOf: [{$ref: '#/components/schemas/RoomFrameLayout'}, {type: 'null'}]}
+        frame_id: {type: [string, 'null'], format: uuid}
+        state: {oneOf: [{$ref: '#/components/schemas/RoomState'}, {type: 'null'}]}
+    AdminUploadSummary:
+      type: object
+      additionalProperties: false
+      required: [media_id, purpose, status, mime, byte_size, created_at, expires_at]
+      properties:
+        media_id: {type: string, format: uuid}
+        purpose: {type: string}
+        status: {type: string}
+        mime: {type: string}
+        byte_size: {type: integer, minimum: 0}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    AdminUserData:
+      type: object
+      additionalProperties: false
+      required: [user, quota_used_bytes, quota_limit_bytes, memories, uploads, rooms, chat_conversation_count, chat_message_count, chat_key_count]
+      properties:
+        user: {$ref: '#/components/schemas/AdminUser'}
+        quota_used_bytes: {type: integer, minimum: 0}
+        quota_limit_bytes: {type: integer, minimum: 0}
+        memories: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AdminMemory'}}
+        uploads: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AdminUploadSummary'}}
+        rooms: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AdminRoom'}}
+        chat_conversation_count: {type: integer, minimum: 0}
+        chat_message_count: {type: integer, minimum: 0}
+        chat_key_count: {type: integer, minimum: 0}
+    AdminPurgeScope:
+      type: string
+      enum: [ALL, MEMORIES, UPLOADS, ROOMS, CHAT]
+    AdminPurgeResult:
+      type: object
+      additionalProperties: false
+      required: [user_id, scope, memories_deleted, uploads_deleted, rooms_deleted, chat_deleted]
+      properties:
+        user_id: {type: string, format: uuid}
+        scope: {$ref: '#/components/schemas/AdminPurgeScope'}
+        memories_deleted: {type: integer, minimum: 0}
+        uploads_deleted: {type: integer, minimum: 0}
+        rooms_deleted: {type: integer, minimum: 0}
+        chat_deleted: {type: integer, minimum: 0}
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id]
+      properties:
+        code: {type: string, enum: [UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, VALIDATION_ERROR, CONFLICT, VERSION_CONFLICT, STATE_CONFLICT, SLOT_OCCUPIED, ROOM_FULL, ALREADY_IN_ROOM, IDEMPOTENCY_CONFLICT, UPLOAD_PENDING, UPLOAD_MISMATCH, SHUTTER_NOT_DUE, MEDIA_EXPIRED, RATE_LIMITED, QUOTA_EXCEEDED, DEPENDENCY_UNAVAILABLE]}
+        message: {type: string, minLength: 1, maxLength: 300, description: 'Safe human-readable summary; never include secrets, URLs or stack traces'}
+        request_id: {type: string, format: uuid}

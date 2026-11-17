@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tinyphoto:realtime-events:1.0.0",
+  "title": "tinyphoto authoritative room event",
+  "description": "Validate the Supabase Broadcast payload, not its Phoenix/WebSocket wrapper. Transport event must equal payload.type. Only backend outbox publishes; clients send REST commands. Topic is the snapshot channel_topic. Events contain metadata only. Versions are room-scoped; deduplicate event_id, recover gaps with a snapshot. MEMBER_LEFT is delivered on the old epoch; remaining members refetch and rejoin. READY_CHANGED is LOBBY-only. Expiry/close/cancel returns room to terminal/LOBBY as specified in master plan.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "type", "room_id", "room_version", "occurred_at", "data"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "event_id": {"$ref": "#/$defs/uuid"},
+    "type": {"enum": ["MEMBER_JOINED", "READY_CHANGED", "MEMBER_LEFT", "HOST_START_COUNTDOWN", "SHUTTER_TRIGGERED", "SLOT_UPLOADED", "ROUND_COMPLETED", "ROUND_CANCELLED", "ROUND_EXPIRED", "ROOM_CLOSED", "ROOM_EXPIRED"]},
+    "room_id": {"$ref": "#/$defs/uuid"},
+    "room_version": {"type": "integer", "minimum": 1},
+    "occurred_at": {"$ref": "#/$defs/time"},
+    "data": {"type": "object"}
+  },
+  "allOf": [
+    {"if": {"properties": {"type": {"const": "MEMBER_JOINED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/memberJoined"}}}},
+    {"if": {"properties": {"type": {"const": "READY_CHANGED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/readyChanged"}}}},
+    {"if": {"properties": {"type": {"const": "MEMBER_LEFT"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/memberLeft"}}}},
+    {"if": {"properties": {"type": {"const": "HOST_START_COUNTDOWN"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/countdown"}}}},
+    {"if": {"properties": {"type": {"const": "SHUTTER_TRIGGERED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/shutter"}}}},
+    {"if": {"properties": {"type": {"const": "SLOT_UPLOADED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/slot"}}}},
+    {"if": {"properties": {"type": {"const": "ROUND_COMPLETED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/roundCompleted"}}}},
+    {"if": {"properties": {"type": {"const": "ROUND_CANCELLED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/roundCancelled"}}}},
+    {"if": {"properties": {"type": {"const": "ROUND_EXPIRED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/roundExpired"}}}},
+    {"if": {"properties": {"type": {"const": "ROOM_CLOSED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/roomClosed"}}}},
+    {"if": {"properties": {"type": {"const": "ROOM_EXPIRED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/roomExpired"}}}}
+  ],
+  "$defs": {
+    "uuid": {"type": "string", "format": "uuid"},
+    "time": {"type": "string", "format": "date-time"},
+    "shotIndex": {"type": "integer", "minimum": 0, "maximum": 3},
+    "memberJoined": {
+      "type": "object", "additionalProperties": false,
+      "required": ["user_id", "display_name", "joined_at", "ready"],
+      "properties": {
+        "user_id": {"$ref": "#/$defs/uuid"},
+        "display_name": {"type": "string", "minLength": 1, "maxLength": 60},
+        "joined_at": {"$ref": "#/$defs/time"},
+        "ready": {"const": false}
+      }
+    },
+    "readyChanged": {
+      "type": "object", "additionalProperties": false,
+      "required": ["user_id", "ready"],
+      "properties": {"user_id": {"$ref": "#/$defs/uuid"}, "ready": {"type": "boolean"}}
+    },
+    "memberLeft": {
+      "type": "object", "additionalProperties": false,
+      "required": ["user_id", "reason", "refetch_required"],
+      "properties": {
+        "user_id": {"$ref": "#/$defs/uuid"},
+        "reason": {"const": "LEFT"},
+        "refetch_required": {"const": true}
+      }
+    },
+    "countdown": {
+      "type": "object", "additionalProperties": false,
+      "required": ["round_id", "host_id", "participant_ids", "shutter_times", "upload_deadline", "composition_deadline"],
+      "properties": {
+        "round_id": {"$ref": "#/$defs/uuid"},
+        "host_id": {"$ref": "#/$defs/uuid"},
+        "participant_ids": {"type": "array", "minItems": 2, "maxItems": 4, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
+        "shutter_times": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/time"}, "description": "Index 0..3, strictly ascending 4s intervals, first 5s after start commit. Client captures once per round/index using a monotonic timer."},
+        "upload_deadline": {"$ref": "#/$defs/time"},
+        "composition_deadline": {"$ref": "#/$defs/time"}
+      }
+    },
+    "shutter": {
+      "type": "object", "additionalProperties": false,
+      "required": ["round_id", "shot_index", "scheduled_at", "materialized_at"],
+      "properties": {
+        "round_id": {"$ref": "#/$defs/uuid"},
+        "shot_index": {"$ref": "#/$defs/shotIndex"},
+        "scheduled_at": {"$ref": "#/$defs/time"},
+        "materialized_at": {"$ref": "#/$defs/time"}
+      },
+      "description": "Server confirmation only. Never retrigger exposure. materialized_at >= scheduled_at; a disconnected client's missed exposure is not recreated."
+    },
+    "slot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["round_id", "user_id", "shot_index", "media_id", "captured_at", "uploaded_count", "expected_count", "round_state"],
+      "properties": {
+        "round_id": {"$ref": "#/$defs/uuid"},
+        "user_id": {"$ref": "#/$defs/uuid"},
+        "shot_index": {"$ref": "#/$defs/shotIndex"},
+        "media_id": {"$ref": "#/$defs/uuid"},
+        "captured_at": {"$ref": "#/$defs/time"},
+        "uploaded_count": {"type": "integer", "minimum": 1, "maximum": 16},
+        "expected_count": {"enum": [8, 12, 16]},
+        "round_state": {"enum": ["COLLECTING", "COMPOSING"]}
+      },
+      "description": "expected_count = frozen participant count * 4; uploaded_count <= expected_count. COMPOSING iff all slots committed. No presigned URL in events."
+    },
+    "roundCompleted": {
+      "type": "object", "additionalProperties": false,
+      "required": ["round_id", "final_media_id", "expires_at", "room_state"],
+      "properties": {
+        "round_id": {"$ref": "#/$defs/uuid"},
+        "final_media_id": {"$ref": "#/$defs/uuid"},
+        "expires_at": {"$ref": "#/$defs/time"},
+        "room_state": {"const": "LOBBY"}
+      },
+      "description": "Reset ready flags; each participant fetches own memory reference through memories API."
+    },
+    "roundCancelled": {
+      "type": "object", "additionalProperties": false,
+      "required": ["round_id", "reason", "room_state"],
+      "properties": {"round_id": {"$ref": "#/$defs/uuid"}, "reason": {"const": "HOST_CANCELLED"}, "room_state": {"const": "LOBBY"}}
+    },
+    "roundExpired": {
+      "type": "object", "additionalProperties": false,
+      "required": ["round_id", "reason", "room_state"],
+      "properties": {"round_id": {"$ref": "#/$defs/uuid"}, "reason": {"enum": ["UPLOAD_TIMEOUT", "COMPOSITION_TIMEOUT"]}, "room_state": {"const": "LOBBY"}}
+    },
+    "roomClosed": {
+      "type": "object", "additionalProperties": false,
+      "required": ["reason", "cancelled_round_id"],
+      "properties": {"reason": {"enum": ["HOST_CLOSED", "HOST_LEFT"]}, "cancelled_round_id": {"type": ["string", "null"], "format": "uuid"}}
+    },
+    "roomExpired": {
+      "type": "object", "additionalProperties": false,
+      "required": ["expires_at", "expired_round_id"],
+      "properties": {"expires_at": {"$ref": "#/$defs/time"}, "expired_round_id": {"type": ["string", "null"], "format": "uuid"}}
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "event_id": "7748a90d-744c-48cb-bd1f-fc9710c33694",
+      "type": "SHUTTER_TRIGGERED",
+      "room_id": "9421edc7-38cf-48ce-9503-ddab57303591",
+      "room_version": 8,
+      "occurred_at": "2026-10-30T03:00:05.120Z",
+      "data": {"round_id": "4e48d45c-38d4-4417-9223-a9bd5c78af72", "shot_index": 0, "scheduled_at": "2026-10-30T03:00:05.000Z", "materialized_at": "2026-10-30T03:00:05.120Z"}
+    }
+  ]
+}
