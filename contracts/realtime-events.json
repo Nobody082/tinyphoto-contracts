@@ -9,7 +9,7 @@
   "properties": {
     "schema_version": {"const": "1.0.0"},
     "event_id": {"$ref": "#/$defs/uuid"},
-    "type": {"enum": ["MEMBER_JOINED", "READY_CHANGED", "MEMBER_LEFT", "HOST_START_COUNTDOWN", "SHUTTER_TRIGGERED", "SLOT_UPLOADED", "ROUND_COMPLETED", "ROUND_CANCELLED", "ROUND_EXPIRED", "ROOM_CLOSED", "ROOM_EXPIRED"]},
+    "type": {"enum": ["MEMBER_JOINED", "MEMBER_SLOT_CHANGED", "READY_CHANGED", "MEMBER_LEFT", "HOST_START_COUNTDOWN", "SHUTTER_TRIGGERED", "SLOT_UPLOADED", "ROUND_COMPLETED", "ROUND_CANCELLED", "ROUND_EXPIRED", "ROOM_CLOSED", "ROOM_EXPIRED"]},
     "room_id": {"$ref": "#/$defs/uuid"},
     "room_version": {"type": "integer", "minimum": 1},
     "occurred_at": {"$ref": "#/$defs/time"},
@@ -17,6 +17,7 @@
   },
   "allOf": [
     {"if": {"properties": {"type": {"const": "MEMBER_JOINED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/memberJoined"}}}},
+    {"if": {"properties": {"type": {"const": "MEMBER_SLOT_CHANGED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/memberSlotChanged"}}}},
     {"if": {"properties": {"type": {"const": "READY_CHANGED"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/readyChanged"}}}},
     {"if": {"properties": {"type": {"const": "MEMBER_LEFT"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/memberLeft"}}}},
     {"if": {"properties": {"type": {"const": "HOST_START_COUNTDOWN"}}}, "then": {"properties": {"data": {"$ref": "#/$defs/countdown"}}}},
@@ -34,12 +35,21 @@
     "shotIndex": {"type": "integer", "minimum": 0, "maximum": 3},
     "memberJoined": {
       "type": "object", "additionalProperties": false,
-      "required": ["user_id", "display_name", "joined_at", "ready"],
+      "required": ["user_id", "display_name", "joined_at", "ready", "slot_index"],
       "properties": {
         "user_id": {"$ref": "#/$defs/uuid"},
         "display_name": {"type": "string", "minLength": 1, "maxLength": 60},
         "joined_at": {"$ref": "#/$defs/time"},
-        "ready": {"const": false}
+        "ready": {"const": false},
+        "slot_index": {"type": "integer", "minimum": 0, "maximum": 5}
+      }
+    },
+    "memberSlotChanged": {
+      "type": "object", "additionalProperties": false,
+      "required": ["user_id", "slot_index"],
+      "properties": {
+        "user_id": {"$ref": "#/$defs/uuid"},
+        "slot_index": {"type": "integer", "minimum": 0, "maximum": 5}
       }
     },
     "readyChanged": {
@@ -52,7 +62,7 @@
       "required": ["user_id", "reason", "refetch_required"],
       "properties": {
         "user_id": {"$ref": "#/$defs/uuid"},
-        "reason": {"const": "LEFT"},
+        "reason": {"enum": ["LEFT", "KICKED"]},
         "refetch_required": {"const": true}
       }
     },
@@ -62,8 +72,8 @@
       "properties": {
         "round_id": {"$ref": "#/$defs/uuid"},
         "host_id": {"$ref": "#/$defs/uuid"},
-        "participant_ids": {"type": "array", "minItems": 2, "maxItems": 4, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
-        "shutter_times": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/time"}, "description": "Index 0..3, strictly ascending 4s intervals, first 5s after start commit. Client captures once per round/index using a monotonic timer."},
+        "participant_ids": {"type": "array", "minItems": 2, "maxItems": 6, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
+        "shutter_times": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/time"}, "description": "Index 0..3, strictly ascending 4s intervals after host start commit. Client captures once per round/index using a monotonic timer."},
         "upload_deadline": {"$ref": "#/$defs/time"},
         "composition_deadline": {"$ref": "#/$defs/time"}
       }
@@ -88,8 +98,8 @@
         "shot_index": {"$ref": "#/$defs/shotIndex"},
         "media_id": {"$ref": "#/$defs/uuid"},
         "captured_at": {"$ref": "#/$defs/time"},
-        "uploaded_count": {"type": "integer", "minimum": 1, "maximum": 16},
-        "expected_count": {"enum": [8, 12, 16]},
+        "uploaded_count": {"type": "integer", "minimum": 1, "maximum": 24},
+        "expected_count": {"enum": [8, 12, 16, 20, 24]},
         "round_state": {"enum": ["COLLECTING", "COMPOSING"]}
       },
       "description": "expected_count = frozen participant count * 4; uploaded_count <= expected_count. COMPOSING iff all slots committed. No presigned URL in events."
